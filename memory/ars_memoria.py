@@ -43,69 +43,119 @@ class ArsMemoria(torch.nn.Module):
         # token prefix when doing recall task
         self.recall_token = torch.nn.Parameter(torch.randn(1, 1, dim))
 
-        self.mask = self._init_mask(autoregressive)
-
-    def _init_mask(self, autoregressive):
         if autoregressive:
-            # standard autoregressive mask
-            mask = torch.full((self.predictor_context, self.predictor_context), float("-inf"))
-            mask = torch.triu(mask, diagonal = 1)
-
-            # memory tokens cannot be modified by future
-            mask_top = torch.full((self.memory_context, self.predictor_context), float("-inf"))
-            mask = torch.cat([mask_top, mask], dim = 0)
-
-            # memory tokens can influence themselves and later tokens
-            mask_left = torch.zeros((self.predictor_context + self.memory_context, self.memory_context))
-            mask = torch.cat([mask_left, mask], dim = 1)
+            self._init_mask()
         else:
-            mask = None
-        return mask
+            self.mask = None
+
+    def _init_mask(self):
+        """Generate the mask for autoregressive prediction. Memory tokens can't be influenced
+        by future tokens, but can influence themselves and future tokens."""
+        # standard autoregressive mask
+        mask = torch.full((self.predictor_context, self.predictor_context), float("-inf"))
+        mask = torch.triu(mask, diagonal = 1)
+
+        # memory tokens cannot be modified by future
+        mask_top = torch.full((self.memory_context, self.predictor_context), float("-inf"))
+        mask = torch.cat([mask_top, mask], dim = 0)
+
+        # memory tokens can influence themselves and later tokens
+        mask_left = torch.zeros((self.predictor_context + self.memory_context, self.memory_context))
+        mask = torch.cat([mask_left, mask], dim = 1)
+        self.register_buffer("mask", mask)
     
-    def autoregression_step(self, x, memories = None):
+    def embed_step(self, x, memories = None):
+        """
+        Embed input tensor and (optionally) memories.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, L, D)
+        memories : torch.Tensor
+            Memory tensor of shape (B, M, D), where M is the number of memory tokens
+        
+        Returns
+        -------
+        embed : torch.Tensor
+            Embedded tensor of shape (B, L, D)
+        memories : torch.Tensor
+            Embedded memory tensor of shape (B, M, D)
+        """
         if memories is None:
             memories = self.memory_token.repeat(x.shape[0], 1, 1)
         full_x = torch.cat([memories.clone(), x], dim = 1)
-        y = self.predictor(full_x, mask = self.mask)[:, self.memory_context:, :]
-        return y, memories
+        embed = self.predictor(full_x, mask = self.mask)[:, self.memory_context:, :]
+        return embed, memories
 
     def forward(self, x, memories = None):
-        y, memories = self.autoregression_step(x, memories = memories)
+        """
+        Run the input and memories through both the predictor and memory encoder.
 
-        new_memories = self.memory_encoder(memories.detach().requires_grad_(), 
-                                           y = y)
-        logits = self.decoder(y)
-        return logits, y, new_memories
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, L, D)
+        memories : torch.Tensor
+            Memory tensor of shape (B, M, D), where M is the number of memory tokens
+        
+        Returns
+        -------
+        logits : torch.Tensor
+            Logits tensor of shape (B, L, D)
+        embed : torch.Tensor
+            Embedded tensor of shape (B, L, D)
+        memories : torch.Tensor
+            Embedded memory tensor of shape (B, M, D)
+        """
+        embed, memories = self.embed_step(x, memories = memories)
+
+        new_memories = self.memory_encoder(memories, 
+                                           y = embed)
+        logits = self.decoder(embed)
+        return logits, embed, new_memories
     
     def autoregressive_loss(self, 
                             embedded_labels, 
                             labels, 
-                            memories = None,
-                            recall_loss = True):
-        logits, y, new_memories = self(embedded_labels, memories = memories)
+                            memories = None):
+        """Compute standard autoregressive loss."""
+        logits, embed, new_memories = self(embedded_labels, memories = memories)
         # remove BOS and EOS
         logits = logits[:, 1:-1, :]
         # labels have no BOS and EOS
         loss = torch.nn.functional.cross_entropy(logits.permute(0, 2, 1),
                                                  labels)
-        if recall_loss:
-            recall_loss = self.recall_loss(embedded_labels, memories)
-            loss += recall_loss
-        return y, new_memories, loss
+
+        return embed, new_memories, loss
     
     def recall_loss(self, embedded_labels, memories):
+        """Recall loss, the abiity of the predictor to reconstruct 
+        the input from the memory tokens."""
         # remove BOS
         embedded_labels = embedded_labels[:, 1:, :]
         masked_seq = self.mask_token.repeat(embedded_labels.shape[0],
                                             embedded_labels.shape[1] + 1,
                                             1)
         masked_seq[:, 0, :] = self.recall_token
-        logits, _, _ = self(masked_seq, memories = memories)
-        loss = torch.nn.functional.mse_loss(logits[:, 1:, :],
+        _, embed, _ = self(masked_seq, memories = memories)
+        loss = torch.nn.functional.mse_loss(embed[:, 1:, :],
                                             embedded_labels)
         return loss
+    
+    def memory_loss(self, embed, memories):
+        """
+        The only recurrent loss, it only acts on the memory encoder.
+        Essentially, run a single embedding through the memory network,
+        then run a chunked version of it through recurrently. The loss
+        ensures they are similar, i.e. doing a large chunk of tokens at once
+        or many small chunks gets the same result.
+        """
+        pass
+    
         
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     random_indices = torch.randint(0, 5, (1, 254)).to(device)
 
@@ -116,11 +166,18 @@ if __name__ == "__main__":
     embedded_indices = embedder(random_indices)
     embedded_labels = torch.cat([bos, embedded_indices, eos], dim = 1)
 
+    memories = torch.randn(1, 16, 512).to(device)
+
     ars = ArsMemoria().to(device)
+    optimizer = torch.optim.Adam(ars.parameters(), lr = 1e-4)
 
     # test first pass
-    y, memories, loss = ars.autoregressive_loss(embedded_labels, random_indices)
-
-    # test second pass, with memories
-    y, memories, loss = ars.autoregressive_loss(embedded_labels, random_indices, memories = memories)
+    embed, memories, ar_loss = ars.autoregressive_loss(embedded_labels, 
+                                                       random_indices,
+                                                       memories = memories)
+    ar_loss.backward()
+    recall_loss = ars.recall_loss(embedded_labels.detach().clone().requires_grad_(True), 
+                                  memories.detach().clone().requires_grad_(True))
+    recall_loss.backward()
+    optimizer.step()
 
