@@ -104,7 +104,16 @@ class Attention(torch.nn.Module):
     dropout : float, optional
         The dropout rate, by default 0.
     bias : bool, optional
-        Whether to use bias in the linear layers, by default False"""
+        Whether to use bias in the linear layers, by default False
+    context_x : int, optional
+        The context length in the x-direction, by default 32
+    context_y : int, optional
+        The context length in the y-direction, by default None
+    has_pos_emb : bool, optional
+        Whether to use positional embeddings, by default True
+    alibi : bool, optional
+        Whether to use the alibi positional embedding, by default True
+    """
     def __init__(self, 
                  dim,
                  dim_head = 64,
@@ -152,7 +161,7 @@ class Attention(torch.nn.Module):
                 self.pos_emb_y = torch.nn.Parameter(torch.randn(1, context_y, self.dim))
 
     #TODO : implement masking for autoregressive here
-    def forward(self, x, y = None):
+    def forward(self, x, y = None, mask = None):
         """Input shape is (batch, seq_len, dim)"""
         x = self.norm(x)
 
@@ -179,6 +188,10 @@ class Attention(torch.nn.Module):
             # sinple :)
             _, _, crop_x, crop_y = attention.shape
             attention += self.alibi_obj.get_M(crop = (crop_x, crop_y))
+
+        if mask is not None:
+            # assuming mask is predefined and filled with -inf
+            attention += mask
 
         attention = self.dropout(attention.softmax(dim = -1))
 
@@ -243,6 +256,8 @@ class Transformer(torch.nn.Module):
         Whether to use positional embeddings, by default True
     alibi : bool, optional
         Whether to use the alibi positional embedding, by default True
+    hidden_multiplier : int, optional
+        The multiplier for the hidden dimension of the feed forward layer, by default 2
     """
     def __init__(self, 
                  dim, 
@@ -278,9 +293,9 @@ class Transformer(torch.nn.Module):
                             dropout = dropout)
             ]))
 
-    def forward(self, x, y = None):
+    def forward(self, x, y = None, mask = None):
         for attention, ff in self.layers:
-            x = x + attention(x, y = y)
+            x = x + attention(x, y = y, mask = mask)
             x = x + ff(x)
         return x
 
