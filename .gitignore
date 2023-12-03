@@ -137,6 +137,8 @@ dmypy.json
 *.csv
 *.zip
 *.log
+*.vocab
+*.model
 
 # Mac Specific Files
 *.DS_Store
