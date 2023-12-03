@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from transformer_blocks import Transformer
 
 class ArsMemoria(torch.nn.Module):
@@ -11,7 +12,37 @@ class ArsMemoria(torch.nn.Module):
                  predictor_context = 256,
                  memory_depth = 4,
                  memory_context = 16,
-                 autoregressive = True):
+                 autoregressive = True,
+                 max_recurrent_steps = 8):
+        """
+        ArsMemoria model, a transformer with a memory encoder and a predictor.
+        The predictor is autoregressive, with recurrent memory tokens. Training
+        is made more compatible with backpropagation by simplifying the recurrence.
+
+        Parameters
+        ----------
+        dim : int
+            Dimension of the model residual stream
+        embed_dim : int
+            Dimension of the token embedding
+        n_heads : int
+            Number of attention heads
+        dropout : float
+            Dropout rate
+        predictor_depth : int
+            Depth of the predictor transformer
+        predictor_context : int
+            Number of tokens to use for the predictor context
+        memory_depth : int
+            Depth of the memory encoder transformer
+        memory_context : int
+            Number of tokens to use for the memory context
+        autoregressive : bool
+            Whether to use autoregressive masking in attention
+        max_recurrent_steps : int
+            For the memory loss, max number of chunks of predictor tokens to use
+            (= number of recurrent steps)        
+        """
         super().__init__()
         self.dim = dim
         self.embed_dim = embed_dim
@@ -20,6 +51,8 @@ class ArsMemoria(torch.nn.Module):
         self.head_dim = dim // n_heads
         self.predictor_context = predictor_context
         self.memory_context = memory_context
+        self.autoregressive = autoregressive
+        self.max_recurrent_steps = max_recurrent_steps
 
         self.dropout = dropout
 
@@ -129,7 +162,9 @@ class ArsMemoria(torch.nn.Module):
 
         return embed, new_memories, loss
     
-    def recall_loss(self, embedded_labels, memories):
+    def recall_loss(self,
+                    embedded_labels,
+                    memories):
         """Recall loss, the abiity of the predictor to reconstruct 
         the input from the memory tokens."""
         # remove BOS
@@ -143,19 +178,65 @@ class ArsMemoria(torch.nn.Module):
                                             embedded_labels)
         return loss
     
-    def memory_loss(self, embed, memories):
+    def memory_loss(self, 
+                    embed, 
+                    memories,
+                    run_vicreg = True,
+                    vicreg_samples = 4):
         """
         The only recurrent loss, it only acts on the memory encoder.
         Essentially, run a single embedding through the memory network,
         then run a chunked version of it through recurrently. The loss
         ensures they are similar, i.e. doing a large chunk of tokens at once
         or many small chunks gets the same result.
+
+        Can run VICReg where the different memory encodings are treated
+        as two different "views" of the memory.
         """
-        pass
+        with torch.no_grad():
+            full_memory = self.memory_encoder(memories, y = embed)
+
+        # generate splits randomly, with varying number and size
+        n_splits = np.random.randint(2, self.max_recurrent_steps)
+        split_indices = torch.rand(n_splits).to(embed.device).sort()[0]
+        split_indices = (split_indices * self.predictor_context).long()
+
+        # recurrent chunk estimation
+        embed_splits = torch.tensor_split(embed, split_indices, dim = 1)
+        for embed_split in embed_splits:
+            memories = self.memory_encoder(memories, y = embed_split)
+
+        # make them close to encourage compositionality
+        loss = torch.nn.functional.mse_loss(memories, full_memory)
+        if run_vicreg:
+            indices = torch.randint(0, memories.shape[1], (vicreg_samples,)).to(memories.device)
+            loss += vicreg(memories[:, indices, :].view(-1, self.dim))
+        return loss
+
+def vicreg(embed, var_weight = 1, cov_weight = 1, gamma = 0.1, eps = 1e-5):
+    """
+    The variance and covariance part of VICReg, 
+    adapted from here:
     
-        
+    https://arxiv.org/pdf/2105.04906.pdf
+    """
+    embed_mean = embed.mean(dim = 0, keepdim = True)
+
+    # variance term
+    variance = gamma - (embed.var(dim = 0) + eps).sqrt()
+    variance = torch.nn.functional.relu(variance).mean()
+
+    # covariance term
+    # (d x batch) @ (batch x d) = (d x d)
+    covariance_context = (embed - embed_mean).T @ (embed - embed_mean) / embed.shape[0]
+
+    # second vicreg term
+    covariance = covariance_context.triu().pow(2).sum()
+    covariance /= covariance_context.shape[0]
+    loss = var_weight * variance + cov_weight * covariance
+    return loss
+
 if __name__ == "__main__":
-    torch.autograd.set_detect_anomaly(True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     random_indices = torch.randint(0, 5, (1, 254)).to(device)
 
@@ -176,8 +257,14 @@ if __name__ == "__main__":
                                                        random_indices,
                                                        memories = memories)
     ar_loss.backward()
+    # TODO : maybe make a detach + clone wrapper
     recall_loss = ars.recall_loss(embedded_labels.detach().clone().requires_grad_(True), 
                                   memories.detach().clone().requires_grad_(True))
     recall_loss.backward()
+    optimizer.step()
+
+    memory_loss = ars.memory_loss(embed.detach().clone().requires_grad_(True), 
+                                  memories.detach().clone().requires_grad_(True))
+    memory_loss.backward()
     optimizer.step()
 
