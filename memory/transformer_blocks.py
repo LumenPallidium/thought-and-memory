@@ -35,7 +35,8 @@ class Alibi(torch.nn.Module):
         n_sequence = torch.arange(start = n_heads, end = 0, step = -1)
         self.head_scalars = 2 ** (-8 / n_sequence)
 
-        self.M = self._create_M()
+        M = self._create_M()
+        self.register_buffer("M", M)
 
         self.requires_grad_(False)
 
@@ -191,7 +192,7 @@ class Attention(torch.nn.Module):
 
         if mask is not None:
             # assuming mask is predefined and filled with -inf
-            attention += mask
+            attention += mask[:attention.shape[-2], :attention.shape[-1]]
 
         attention = self.dropout(attention.softmax(dim = -1))
 

@@ -56,6 +56,7 @@ class ArsMemoria(torch.nn.Module):
 
         self.dropout = dropout
 
+        self.embedder = torch.nn.Embedding(embed_dim, dim)
         self.predictor = Transformer(dim = dim,
                                      depth = predictor_depth,
                                      heads = n_heads,
@@ -148,15 +149,25 @@ class ArsMemoria(torch.nn.Module):
         logits = self.decoder(embed)
         return logits, embed, new_memories
     
+    def sample(self, prompt_indices, memories = None, len = 20, top_k = 5):
+        for i in range(len):
+            encoded = self.embedder(prompt_indices)
+            logits, _, memories = self(encoded, memories = memories)
+            logits = logits[:, -1, :]
+            logits = torch.nn.functional.softmax(logits, dim = -1)
+            logits = torch.multinomial(logits, 1)
+            prompt_indices = torch.cat([prompt_indices, logits], dim = 1)
+        return prompt_indices
+
     def autoregressive_loss(self, 
                             embedded_labels, 
                             labels, 
                             memories = None):
         """Compute standard autoregressive loss."""
         logits, embed, new_memories = self(embedded_labels, memories = memories)
-        # remove BOS and EOS
-        logits = logits[:, 1:-1, :]
-        # labels have no BOS and EOS
+        # shift labels
+        labels = labels[:, 1:]
+        logits = logits[:, :-1, :]
         loss = torch.nn.functional.cross_entropy(logits.permute(0, 2, 1),
                                                  labels)
 
@@ -199,7 +210,7 @@ class ArsMemoria(torch.nn.Module):
 
         # generate splits randomly, with varying number and size
         n_splits = np.random.randint(2, self.max_recurrent_steps)
-        split_indices = torch.rand(n_splits).to(embed.device).sort()[0]
+        split_indices = torch.rand(n_splits).sort()[0]
         split_indices = (split_indices * self.predictor_context).long()
 
         # recurrent chunk estimation
@@ -240,27 +251,29 @@ def vicreg(embed, var_weight = 1, cov_weight = 1, gamma = 0.1, eps = 1e-5):
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    random_indices = torch.randint(0, 5, (1, 254)).to(device)
+    random_indices = torch.randint(2, 7, (1, 254)).to(device)
 
-    embedder = torch.nn.Embedding(5, 512).to(device)
-    bos = torch.randn(1, 1, 512).to(device)
-    eos = torch.randn(1, 1, 512).to(device)
+    bos = torch.tensor([0]).to(device)
+    eos = torch.tensor([1]).to(device)
 
-    embedded_indices = embedder(random_indices)
-    embedded_labels = torch.cat([bos, embedded_indices, eos], dim = 1)
+    random_indices = torch.cat([bos.repeat(random_indices.shape[0], 1),
+                                random_indices,
+                                eos.repeat(random_indices.shape[0], 1)], dim = 1)
 
-    memories = torch.randn(1, 16, 512).to(device)
 
-    ars = ArsMemoria().to(device)
+    ars = ArsMemoria(embed_dim = 7).to(device)
     optimizer = torch.optim.Adam(ars.parameters(), lr = 1e-4)
 
+    embedded_indices = ars.embedder(random_indices)
+
+    memories = torch.randn(1, 16, 512).to(device)
     # test first pass
-    embed, memories, ar_loss = ars.autoregressive_loss(embedded_labels, 
+    embed, memories, ar_loss = ars.autoregressive_loss(embedded_indices, 
                                                        random_indices,
                                                        memories = memories)
     ar_loss.backward()
     # TODO : maybe make a detach + clone wrapper
-    recall_loss = ars.recall_loss(embedded_labels.detach().clone().requires_grad_(True), 
+    recall_loss = ars.recall_loss(embed.detach().clone().requires_grad_(True), 
                                   memories.detach().clone().requires_grad_(True))
     recall_loss.backward()
     optimizer.step()
