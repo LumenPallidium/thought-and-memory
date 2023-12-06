@@ -3,8 +3,17 @@ import zipfile
 import requests
 import torch
 import tqdm
+import numpy as np
 import sentencepiece as spm
 from ars_memoria import ArsMemoria
+
+def losses_to_running_loss(losses, alpha = 0.95):
+    running_losses = []
+    running_loss = losses[0]
+    for loss in losses:
+        running_loss = (1 - alpha) * loss + alpha * running_loss
+        running_losses.append(running_loss)
+    return running_losses
 
 def get_wikitext(link = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip",
                  save_dir = "../data/"):
@@ -66,30 +75,46 @@ class TextDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+#TODO : add test perplexity
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
     dim = 512
-    n_epochs = 10
+    n_epochs = 200
     recurrent_steps = 8
     n_tokens = 256
-    vocab_size = 8192
+    vocab_size = 16384
     bos_id = 1
     eos_id = 2
-    memory_loss_weight = 0.01
-    recall_loss_weight = 2
+    memory_loss_weight = 0.125
+    recall_loss_weight = 0.5
     batch_size = 64
+    accumulation_steps = 8
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     get_wikitext()
-    wikitext = TextDataset("../data/wikitext-2-raw/wiki.train.raw")
+    wikitext = TextDataset("../data/wikitext-2-raw/wiki.train.raw",
+                           vocab_size = vocab_size,)
     ars = ArsMemoria(dim = dim,
-                       predictor_context = n_tokens,
-                       embed_dim = vocab_size).to(device)
+                     predictor_context = n_tokens,
+                     embed_dim = vocab_size).to(device)
+    print(f"Model initialized with {sum(p.numel() for p in ars.parameters() if p.requires_grad)} trainable parameters.")
     optimizer = torch.optim.Adam(ars.parameters(), lr=1e-4)
 
-    test_prompt = wikitext.sp_model.EncodeAsIds("Hello world! I am ")
+    test_prompt = wikitext.sp_model.EncodeAsIds("The former french writers ")
     test_prompt = torch.tensor(test_prompt).unsqueeze(0).to(device)
 
     losses = []
+
+    loss_scaler = 1 / accumulation_steps
+
+    ar_loss_avg = 1
+    recall_loss_avg = 1
+    memory_loss_avg = 1
+
+    os.makedirs("../data/models", exist_ok=True)
+    if os.path.exists("../data/models/ars.pt"):
+        ars.load_state_dict(torch.load("../data/models/ars.pt"))
+        print("Loaded model.")
 
     for epoch in range(n_epochs):
         print(f"Epoch {epoch + 1} / {n_epochs}")
@@ -103,7 +128,7 @@ if __name__ == "__main__":
                                             shuffle=True, 
                                             collate_fn=lambda x: collate2seqlen(x, wikitext.sp_model))
         pbar = tqdm.tqdm(total=len(train_loader) * recurrent_steps)
-        for batch in train_loader:
+        for batch_num, batch in enumerate(train_loader):
             if batch is not None:
                 optimizer.zero_grad()
                 memories = None
@@ -121,24 +146,37 @@ if __name__ == "__main__":
                     embed, memories, ar_loss = ars.autoregressive_loss(embedded_labels, 
                                                                     x,
                                                                     memories = memories)
+                    ar_loss = ar_loss * loss_scaler
                     ar_loss.backward()
                     # TODO : maybe make a detach + clone wrapper
                     recall_loss = ars.recall_loss(embedded_labels.detach().clone().requires_grad_(True), 
                                                 memories.detach().clone().requires_grad_(True))
-                    recall_loss = recall_loss * recall_loss_weight
+                    recall_loss = recall_loss * recall_loss_weight * loss_scaler
                     recall_loss.backward()
-                    optimizer.step()
 
                     memory_loss = ars.memory_loss(embed.detach().clone().requires_grad_(True), 
                                                 memories.detach().clone().requires_grad_(True))
-                    memory_loss = memory_loss * memory_loss_weight
+                    memory_loss = memory_loss * memory_loss_weight * loss_scaler
                     memory_loss.backward()
-                    optimizer.step()
 
                     memories = memories.detach().clone().requires_grad_(True)
+
+                    ar_loss_avg = ar_loss_avg * 0.96 + ar_loss.item() * 0.04
+                    recall_loss_avg = recall_loss_avg * 0.96 + recall_loss.item() * 0.04
+                    memory_loss_avg = memory_loss_avg * 0.96 + memory_loss.item() * 0.04
+
                     pbar.update(1)
-                    pbar.set_description(f"Losses : AR : {round(ar_loss.item())} | Recall : {round(recall_loss.item())} | Memory : {round(memory_loss.item())}")
+                    pbar.set_description(f"Losses : AR : {round(ar_loss_avg, 2)} | Recall : {round(recall_loss_avg, 2)} | Memory : {round(memory_loss_avg, 2)}")
 
                     losses.append(ar_loss.item() + recall_loss.item() + memory_loss.item())
+                if (batch_num + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    
         pbar.close()
+        torch.save(ars.state_dict(), f"../data/models/ars.pt")
+
+    losses = losses_to_running_loss(losses)
+    log_losses = np.log(losses)
+    plt.plot(losses)
+
 

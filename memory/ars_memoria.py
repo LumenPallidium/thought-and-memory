@@ -174,6 +174,7 @@ class ArsMemoria(torch.nn.Module):
         return embed, new_memories, loss
     
     #TODO : this only uses a single past memory/embedding, can we do multiple?
+    #TODO : MSE between token running average is an interesting idea for this
     def recall_loss(self,
                     embedded_labels,
                     memories):
@@ -221,12 +222,13 @@ class ArsMemoria(torch.nn.Module):
         # make them close to encourage compositionality
         loss = torch.nn.functional.mse_loss(memories, full_memory)
         if run_vicreg:
-            indices = torch.randint(0, memories.shape[1], (vicreg_samples,)).to(memories.device)
-            loss += vicreg(memories[:, indices, :].view(-1, self.dim))
+            cat_memories = torch.cat([memories, full_memory], dim = 1)
+            indices = torch.randint(0, cat_memories.shape[1], (vicreg_samples,)).to(cat_memories.device)
+            loss += vicreg(cat_memories[:, indices, :].view(-1, self.dim))
         return loss
 
 #TODO : interesting https://www.biorxiv.org/content/10.1101/2022.11.04.515143v2
-def vicreg(embed, var_weight = 1, cov_weight = 1, gamma = 0.1, eps = 1e-5):
+def vicreg(embed, var_weight = 1, cov_weight = 0.001, gamma = 4, eps = 1e-5):
     """
     The variance and covariance part of VICReg, 
     adapted from here:
