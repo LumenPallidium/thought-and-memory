@@ -89,6 +89,7 @@ if __name__ == "__main__":
     recall_loss_weight = 0.5
     batch_size = 64
     accumulation_steps = 8
+    lr = 1e-3
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     get_wikitext()
@@ -98,10 +99,15 @@ if __name__ == "__main__":
                      predictor_context = n_tokens,
                      embed_dim = vocab_size).to(device)
     print(f"Model initialized with {sum(p.numel() for p in ars.parameters() if p.requires_grad)} trainable parameters.")
-    optimizer = torch.optim.Adam(ars.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(ars.parameters(), lr=lr)
 
     test_prompt = wikitext.sp_model.EncodeAsIds("The former french writers ")
     test_prompt = torch.tensor(test_prompt).unsqueeze(0).to(device)
+
+    recall_str = "Approximately 500 of the writers were not really French, they were Canadian."
+    recall_prompt = wikitext.sp_model.EncodeAsIds(recall_str)
+    recall_prompt = torch.tensor(recall_prompt).unsqueeze(0).to(device)
+    recall_emb = ars.embedder(recall_prompt)
 
     losses = []
 
@@ -119,9 +125,18 @@ if __name__ == "__main__":
     for epoch in range(n_epochs):
         print(f"Epoch {epoch + 1} / {n_epochs}")
 
-        # example for this epoch
-        completion = ars.sample(test_prompt.to(device), len = 10)
-        print(wikitext.sp_model.DecodeIds(completion[0].tolist()))
+        with torch.no_grad():
+            # example for this epoch
+            completion = ars.sample(test_prompt.to(device), len = 10)
+            print("\n", wikitext.sp_model.DecodeIds(completion[0].tolist()))
+
+            # recall
+            _, embed, memory = ars(recall_emb)
+            embed = embed[:, 1:, :]
+            logits, _ = ars.recall(embed, memory)
+            logits = logits.argmax(dim = -1)
+            print(f"Recalling '{recall_str}' as")
+            print(wikitext.sp_model.DecodeIds(logits[0].tolist()), "\n")
 
         train_loader = torch.utils.data.DataLoader(wikitext,
                                             batch_size=batch_size, 
@@ -147,12 +162,12 @@ if __name__ == "__main__":
                                                                     x,
                                                                     memories = memories)
                     ar_loss = ar_loss * loss_scaler
-                    ar_loss.backward()
                     # TODO : maybe make a detach + clone wrapper
-                    recall_loss = ars.recall_loss(embedded_labels.detach().clone().requires_grad_(True), 
-                                                memories.detach().clone().requires_grad_(True))
+                    recall_loss = ars.recall_loss(embed.detach().clone().requires_grad_(True), 
+                                                  memories)
                     recall_loss = recall_loss * recall_loss_weight * loss_scaler
-                    recall_loss.backward()
+                    loss = ar_loss + recall_loss
+                    loss.backward()
 
                     memory_loss = ars.memory_loss(embed.detach().clone().requires_grad_(True), 
                                                 memories.detach().clone().requires_grad_(True))

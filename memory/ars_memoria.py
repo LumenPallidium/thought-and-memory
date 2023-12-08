@@ -144,19 +144,34 @@ class ArsMemoria(torch.nn.Module):
         """
         embed, memories = self.embed_step(x, memories = memories)
 
-        new_memories = self.memory_encoder(memories, 
+        new_memories = self.memory_encoder(memories.detach().clone().requires_grad_(True), 
                                            y = embed)
         logits = self.decoder(embed)
         return logits, embed, new_memories
     
-    def sample(self, prompt_indices, memories = None, len = 20, top_k = 5):
+    def sample(self, 
+               prompt_indices, 
+               memories = None, 
+               len = 20, 
+               temp = 0.1, 
+               nucleus = True,
+               top_percent = 0.9):
         for i in range(len):
             encoded = self.embedder(prompt_indices)
             logits, _, memories = self(encoded, memories = memories)
             logits = logits[:, -1, :]
-            logits = torch.nn.functional.softmax(logits, dim = -1)
-            logits = torch.multinomial(logits, 1)
-            prompt_indices = torch.cat([prompt_indices, logits], dim = 1)
+            logits = torch.nn.functional.softmax(logits / temp, dim = -1)
+            if nucleus:
+                sorted_logits, sorted_indices = torch.sort(logits, descending = True)
+                cumulative_probs = torch.cumsum(sorted_logits, dim = -1)
+                removals = cumulative_probs < top_percent
+                sorted_logits, sorted_indices = sorted_logits[~removals], sorted_indices[~removals]
+                sorted_logits /= sorted_logits.sum()
+                index_index = torch.multinomial(sorted_logits, 1)
+                token = sorted_indices[index_index].unsqueeze(0)
+            else:
+                token = torch.multinomial(logits, 1)
+            prompt_indices = torch.cat([prompt_indices, token], dim = 1)
         return prompt_indices
 
     def autoregressive_loss(self, 
@@ -180,16 +195,20 @@ class ArsMemoria(torch.nn.Module):
                     memories):
         """Recall loss, the abiity of the predictor to reconstruct 
         the input from the memory tokens."""
-        # remove BOS
+        # remove bos token
         embedded_labels = embedded_labels[:, 1:, :]
+        _, embed = self.recall(embedded_labels, memories)
+        loss = torch.nn.functional.mse_loss(embed,
+                                            embedded_labels)
+        return loss
+    
+    def recall(self, embedded_labels, memories):
         masked_seq = self.mask_token.repeat(embedded_labels.shape[0],
                                             embedded_labels.shape[1] + 1,
                                             1)
         masked_seq[:, 0, :] = self.recall_token
-        _, embed, _ = self(masked_seq, memories = memories)
-        loss = torch.nn.functional.mse_loss(embed[:, 1:, :],
-                                            embedded_labels)
-        return loss
+        logits, embed, _ = self(masked_seq, memories = memories)
+        return logits, embed[:, 1:, :]
     
     def memory_loss(self, 
                     embed, 
