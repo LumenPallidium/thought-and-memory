@@ -181,7 +181,7 @@ if __name__ == "__main__":
                     memory_loss_avg = memory_loss_avg * 0.96 + memory_loss.item() * 0.04
 
                     pbar.update(1)
-                    pbar.set_description(f"Losses : AR : {round(ar_loss_avg, 2)} | Recall : {round(recall_loss_avg, 2)} | Memory : {round(memory_loss_avg, 2)}")
+                    pbar.set_description(f"Losses : AR : {round(ar_loss_avg, 2)} | Recall : {round(recall_loss_avg, 2)} | Mem : {round(memory_loss_avg, 2)}")
 
                     losses.append(ar_loss.item() + recall_loss.item() + memory_loss.item())
                 if (batch_num + 1) % accumulation_steps == 0:

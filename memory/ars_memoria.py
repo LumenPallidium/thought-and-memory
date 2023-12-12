@@ -98,7 +98,7 @@ class ArsMemoria(torch.nn.Module):
         mask = torch.cat([mask_left, mask], dim = 1)
         self.register_buffer("mask", mask)
     
-    def embed_step(self, x, memories = None):
+    def embed_step(self, x, memories = None, use_mask = True):
         """
         Embed input tensor and (optionally) memories.
 
@@ -108,6 +108,8 @@ class ArsMemoria(torch.nn.Module):
             Input tensor of shape (B, L, D)
         memories : torch.Tensor
             Memory tensor of shape (B, M, D), where M is the number of memory tokens
+        use_mask : bool
+            Whether to use the autoregressive mask
         
         Returns
         -------
@@ -115,14 +117,17 @@ class ArsMemoria(torch.nn.Module):
             Embedded tensor of shape (B, L, D)
         memories : torch.Tensor
             Embedded memory tensor of shape (B, M, D)
+
         """
         if memories is None:
             memories = self.memory_token.repeat(x.shape[0], 1, 1)
         full_x = torch.cat([memories.clone(), x], dim = 1)
-        embed = self.predictor(full_x, mask = self.mask)[:, self.memory_context:, :]
+        mask = self.mask if use_mask else None
+        embed = self.predictor(full_x, 
+                               mask = mask)[:, self.memory_context:, :]
         return embed, memories
 
-    def forward(self, x, memories = None):
+    def forward(self, x, memories = None, use_mask = True):
         """
         Run the input and memories through both the predictor and memory encoder.
 
@@ -132,6 +137,8 @@ class ArsMemoria(torch.nn.Module):
             Input tensor of shape (B, L, D)
         memories : torch.Tensor
             Memory tensor of shape (B, M, D), where M is the number of memory tokens
+        use_mask : bool
+            Whether to use the autoregressive mask
         
         Returns
         -------
@@ -142,7 +149,9 @@ class ArsMemoria(torch.nn.Module):
         memories : torch.Tensor
             Embedded memory tensor of shape (B, M, D)
         """
-        embed, memories = self.embed_step(x, memories = memories)
+        embed, memories = self.embed_step(x,
+                                          memories = memories,
+                                          use_mask = use_mask)
 
         new_memories = self.memory_encoder(memories.detach().clone().requires_grad_(True), 
                                            y = embed)
@@ -203,11 +212,15 @@ class ArsMemoria(torch.nn.Module):
         return loss
     
     def recall(self, embedded_labels, memories):
+        """Recall task, the abiity of the predictor to reconstruct
+        the input from the memory tokens. Note the autoregressive
+        mask is not used here, recall can use all surrounding tokens
+        to reconstruct."""
         masked_seq = self.mask_token.repeat(embedded_labels.shape[0],
                                             embedded_labels.shape[1] + 1,
                                             1)
         masked_seq[:, 0, :] = self.recall_token
-        logits, embed, _ = self(masked_seq, memories = memories)
+        logits, embed, _ = self(masked_seq, memories = memories, use_mask = False)
         return logits, embed[:, 1:, :]
     
     def memory_loss(self, 
